@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""INFOCOM v2 gate-image pipeline (ROM_DEBUG.md section 70).
+
+Turns the APPROVED flat calibration-gate assets —
+workspace/zmachine-vb/gate-flat-left.png and
+gate-flat-right.png (Seth's settled design, Nov 15
+22:04–22:28; design master gate-design-master-
+chatgpt.png) — into the VIP tile/map data the
+INFOCOM2 ROM displays as its first screen.
+
+Method: the assets are already flat 4-shade red
+images (pure reds: R in {0, 85, 170, 255}, G=B=0),
+so conversion is a lossless quantization — shade =
+R // 85, verified against the PNG luminance values
+{0, 25, 51, 76}. NO dithering: flat artwork converts
+flat (Seth's standing rule, Nov 15 22:21 — Bayer
+dithering is for 3D model renders only). Both eyes
+tile 8x8 into ONE shared char pool (first-seen
+order, left eye first, row-major), VIP char packing
+as verified in section 45 (the BOOTSPLASH pipeline's
+tile_bytes). The left/right pair differs only in the
+corner squares, split diagonally by eye per Seth's
+calibration spec: left eye upper-left + lower-right,
+right eye upper-right + lower-left (verified against
+the assets pixel-for-pixel before generation).
+
+Outputs (this directory):
+    gatedata.h               gateChars[], gateMapL[] /
+                             gateMapR[], GATE_TILE_COUNT
+    gate-preview-left.png    red-shade previews rendered
+    gate-preview-right.png   back from the quantized
+    gate-preview-anaglyph.png  shades the ROM holds
+                             (R=left, G+B=right)
+"""
+import os
+import numpy as np
+from PIL import Image
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ZM = os.path.join(HERE, '..', '..', '..', 'zmachine-vb')
+W, H = 384, 224
+
+
+def shades(name):
+    im = Image.open(os.path.join(ZM, name)).convert('RGB')
+    a = np.asarray(im).astype(np.int64)
+    assert a.shape == (H, W, 3), a.shape
+    assert (a[..., 1] == 0).all() and (a[..., 2] == 0).all(), \
+        'asset is not pure-red'
+    r = a[..., 0]
+    assert set(np.unique(r)) <= {0, 85, 170, 255}, np.unique(r)
+    return (r // 85).astype(np.uint8)
+
+
+L = shades('gate-flat-left.png')
+R = shades('gate-flat-right.png')
+
+# The pair must differ ONLY in the corner squares
+# (diagonal split by eye): differences confined to
+# the four 32x32 corner blocks.
+d = np.argwhere(L != R)
+assert len(d) > 0
+for (y, x) in d:
+    assert (y < 32 or y > H - 33) and (x < 32 or x > W - 33), \
+        f'left/right differ outside corner blocks at {(y, x)}'
+print(f'left/right differ at {len(d)} px, all inside the '
+      f'corner blocks (diagonal split confirmed)')
+
+# --- tile into one shared pool -------------------------------------
+# The blank tile is seeded as index 0 BY NECESSITY: the
+# front end (and every other screen in this lineage)
+# uses BG entry 0 for blank cells, so tile 0 must be
+# blank. (v2's first build learned this the visible
+# way: pool order put a corner-square fragment at
+# index 0 and every blank cell on the front-end
+# screen wore it.)
+pool = {bytes(64): 0}
+pool_cells = [np.zeros((8, 8), dtype=np.uint8)]
+
+
+def tile_grid(img):
+    grid = np.zeros((28, 48), dtype=np.int64)
+    for r in range(28):
+        for c in range(48):
+            cell = img[r * 8:(r + 1) * 8, c * 8:(c + 1) * 8]
+            key = cell.tobytes()
+            if key not in pool:
+                pool[key] = len(pool)
+                pool_cells.append(cell)
+            grid[r, c] = pool[key]
+    return grid
+
+
+gridL = tile_grid(L)
+gridR = tile_grid(R)
+print(f'unique tiles: shared pool {len(pool)} chars '
+      f'({len(pool) * 16} bytes of char data)')
+assert len(pool) <= 512, 'gate pool must fit CharSeg0'
+
+
+def tile_bytes(cell):
+    out = bytearray()
+    for r in range(8):
+        w = 0
+        for x in range(8):
+            w |= int(cell[r, x]) << (2 * x)
+        out.append(w & 0xFF)
+        out.append((w >> 8) & 0xFF)
+    return bytes(out)
+
+
+char_data = b''.join(tile_bytes(cell) for cell in pool_cells)
+
+
+def redimg(a):
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+    out[..., 0] = (a * 85).astype(np.uint8)
+    return out
+
+
+Image.fromarray(redimg(L)).save(os.path.join(HERE, 'gate-preview-left.png'))
+Image.fromarray(redimg(R)).save(os.path.join(HERE, 'gate-preview-right.png'))
+ana = np.zeros((H, W, 3), dtype=np.uint8)
+ana[..., 0] = (L * 85).astype(np.uint8)
+ana[..., 1] = (R * 85).astype(np.uint8)
+ana[..., 2] = (R * 85).astype(np.uint8)
+Image.fromarray(ana).save(os.path.join(HERE, 'gate-preview-anaglyph.png'))
+
+
+def fmt_bytes(data, per=12):
+    lines = []
+    for i in range(0, len(data), per):
+        lines.append('\t' + ', '.join(f'0x{b:02X}'
+                                       for b in data[i:i + per]) + ',')
+    return '\n'.join(lines)
+
+
+def fmt_map(grid):
+    lines = []
+    for r in range(28):
+        lines.append('\t' + ', '.join(str(int(v)) for v in grid[r]) + ',')
+    return '\n'.join(lines)
+
+
+hdr = f"""#ifndef _GATEDATA_
+#define _GATEDATA_
+/*
+ * gatedata.h - the Virtual Infocom calibration gate
+ * as VIP data. GENERATED by gen_gate_images.py - do
+ * not hand-edit.
+ *
+ * Source: the approved flat assets gate-flat-left.png
+ * / gate-flat-right.png in workspace/zmachine-vb/
+ * (Seth's settled design, 2026-11-15; master:
+ * gate-design-master-chatgpt.png). Conversion is a
+ * lossless shade quantization (pure reds, R//85) -
+ * NO dithering; flat artwork converts flat.
+ *
+ * gateChars: {len(pool)} unique 8x8 tiles shared by
+ * both eyes, 16 bytes each in the VIP char packing.
+ * gateMapL / gateMapR: 48x28 BG entries (tile
+ * indices, palette 0), row-major; the maps differ
+ * only in the corner squares, split diagonally by
+ * eye (left: upper-left + lower-right; right:
+ * upper-right + lower-left).
+ */
+
+#define GATE_TILE_COUNT {len(pool)}
+
+static const BYTE gateChars[] = {{
+{fmt_bytes(char_data)}
+}};
+
+static const u16 gateMapL[28 * 48] = {{
+{fmt_map(gridL)}
+}};
+
+static const u16 gateMapR[28 * 48] = {{
+{fmt_map(gridR)}
+}};
+
+#endif
+"""
+with open(os.path.join(HERE, 'gatedata.h'), 'w') as f:
+    f.write(hdr)
+print('wrote gatedata.h')
